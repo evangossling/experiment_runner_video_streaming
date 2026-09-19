@@ -674,19 +674,11 @@ def run_server():
         if not CFG.EXPERIMENTS:
             raise RuntimeError("No experiments configured")
 
-        first_exp = CFG.EXPERIMENTS[0]
-        first_name = first_exp["name"]
-        first_log_dir = Path(video_cwd) / first_name / CFG.RUNNER_LOG_SUBDIR / "1"
-
-        warn_if_stale_trial_dirs(Path(video_cwd) / first_name)
-
-        current_tunnel = start_logged(
-            server_tunnel_command(first_exp),
-            cwd=tunnel_cwd,
-            log_file=str(first_log_dir / "server_tunnel.log"),
-            name="tunnel-server",
-        )
-
+        # Deliberately NOT starting the first tunnel here. It only starts
+        # once the client has connected and is about to start its own --
+        # see the unified per-experiment block below. Starting it earlier
+        # meant it sat running (and logging) through the client's route
+        # check, sidecar 60s warmup, and connection retries for no reason.
         conn = control.accept()
 
         hello = conn.recv_line(timeout=120)
@@ -702,31 +694,37 @@ def run_server():
             exp_dir = Path(video_cwd) / name
             log_root = exp_dir / CFG.RUNNER_LOG_SUBDIR
 
-            if exp_index > 0:
-                warn_if_stale_trial_dirs(exp_dir)
-                print(f"[runner] preparing server tunnel for {name}", flush=True)
+            # Every experiment (including the first) goes through the same
+            # stop-old / start-new handshake. For the first experiment
+            # there's nothing to stop on either side -- the client's ack
+            # is immediate -- but this keeps the tunnel's lifetime tightly
+            # bound to "right before it's actually used" instead of
+            # "for the whole run".
+            warn_if_stale_trial_dirs(exp_dir)
+            print(f"[runner] preparing server tunnel for {name}", flush=True)
 
-                conn.send_line(f"SERVER_RESTART:{name}")
+            conn.send_line(f"SERVER_RESTART:{name}")
 
-                ack = conn.recv_line(timeout=60)
-                if ack != f"CLIENT_TUNNEL_STOPPED:{name}":
-                    raise RuntimeError(
-                        f"Expected tunnel-stop ACK for {name}, got {ack}"
-                    )
+            ack = conn.recv_line(timeout=60)
+            if ack != f"CLIENT_TUNNEL_STOPPED:{name}":
+                raise RuntimeError(
+                    f"Expected tunnel-stop ACK for {name}, got {ack}"
+                )
 
+            if current_tunnel:
                 terminate_process(current_tunnel, "tunnel-server")
                 unregister(current_tunnel)
                 current_tunnel = None
 
-                first_log_dir = log_root / "1"
-                current_tunnel = start_logged(
-                    server_tunnel_command(exp),
-                    cwd=tunnel_cwd,
-                    log_file=str(first_log_dir / "server_tunnel.log"),
-                    name="tunnel-server",
-                        )
+            first_log_dir = log_root / "1"
+            current_tunnel = start_logged(
+                server_tunnel_command(exp),
+                cwd=tunnel_cwd,
+                log_file=str(first_log_dir / "server_tunnel.log"),
+                name="tunnel-server",
+            )
 
-                conn.send_line(f"SERVER_TUNNEL_STARTED:{name}")
+            conn.send_line(f"SERVER_TUNNEL_STARTED:{name}")
 
             for trial in range(1, trials + 1):
                 trial_log_dir = log_root / str(trial)
@@ -847,41 +845,43 @@ def run_client():
             log_root = exp_dir / CFG.RUNNER_LOG_SUBDIR
             log_root.mkdir(parents=True, exist_ok=True)
 
-            if exp_index > 0:
-                msg = conn.recv_line(timeout=180)
-                if msg != f"SERVER_RESTART:{name}":
-                    raise RuntimeError(
-                        f"Expected SERVER_RESTART:{name}, got {msg}"
-                    )
+            # Every experiment (including the first) goes through the same
+            # stop-old / start-new handshake with the server, so the
+            # client's tunnel -- like the server's -- only starts right
+            # before it's used, not for the whole run.
+            msg = conn.recv_line(timeout=180)
+            if msg != f"SERVER_RESTART:{name}":
+                raise RuntimeError(
+                    f"Expected SERVER_RESTART:{name}, got {msg}"
+                )
 
-                if tunnel_proc:
-                    terminate_process(tunnel_proc, "tunnel-client")
-                    unregister(tunnel_proc)
-                    tunnel_proc = None
+            if tunnel_proc:
+                terminate_process(tunnel_proc, "tunnel-client")
+                unregister(tunnel_proc)
+                tunnel_proc = None
 
-                conn.send_line(f"CLIENT_TUNNEL_STOPPED:{name}")
+            conn.send_line(f"CLIENT_TUNNEL_STOPPED:{name}")
 
-                msg = conn.recv_line(timeout=180)
-                if msg != f"SERVER_TUNNEL_STARTED:{name}":
-                    raise RuntimeError(
-                        f"Expected SERVER_TUNNEL_STARTED:{name}, got {msg}"
-                    )
+            msg = conn.recv_line(timeout=180)
+            if msg != f"SERVER_TUNNEL_STARTED:{name}":
+                raise RuntimeError(
+                    f"Expected SERVER_TUNNEL_STARTED:{name}, got {msg}"
+                )
 
             needs_inferred = bool(exp.get("needs_inferred", False))
 
-            if tunnel_proc is None:
-                first_log_dir = log_root / "1"
-                first_log_dir.mkdir(parents=True, exist_ok=True)
-                if needs_inferred:
-                    monitor.reset()
-                tunnel_proc = start_client_tunnel(exp, first_log_dir)
+            first_log_dir = log_root / "1"
+            first_log_dir.mkdir(parents=True, exist_ok=True)
+            if needs_inferred:
+                monitor.reset()
+            tunnel_proc = start_client_tunnel(exp, first_log_dir)
 
-                wait_or_stop(2)
-                if tunnel_proc.poll() is not None:
-                    raise RuntimeError(
-                        f"tunnel-client exited early with code "
-                        f"{tunnel_proc.returncode}"
-                    )
+            wait_or_stop(2)
+            if tunnel_proc.poll() is not None:
+                raise RuntimeError(
+                    f"tunnel-client exited early with code "
+                    f"{tunnel_proc.returncode}"
+                )
 
             for trial in range(1, trials + 1):
                 trial_log_dir = log_root / str(trial)
@@ -902,25 +902,19 @@ def run_client():
                 iperf_log = trial_log_dir / "iperf.log"
 
                 if needs_inferred:
-                    # The 90s iperf always runs in full, checking for both
-                    # Inferred lines throughout. If they're still missing
-                    # at the end, run an additional 60s.
-                    def run_initial_iperf():
-                        run_iperf(
-                            CFG.IPERF_INITIAL_BANDWIDTH,
-                            CFG.IPERF_INITIAL_SECONDS,
-                            str(iperf_log),
-                            "iperf3-20M-90s",
-                        )
-
-                    iperf_thread = threading.Thread(target=run_initial_iperf,
-                                                      daemon=True)
-                    iperf_thread.start()
-                    while iperf_thread.is_alive():
-                        if stop_event.is_set():
-                            raise RuntimeError("Stopped during iperf")
-                        time.sleep(0.25)
-                    iperf_thread.join()
+                    # The 90s iperf always runs in full. If both Inferred
+                    # lines are still missing afterward, run an additional
+                    # 60s. run_iperf() (via run_command) already enforces
+                    # its own timeout and honors stop_event internally, so
+                    # this runs directly -- no need for a wrapper thread,
+                    # which would otherwise swallow a timeout/failure here
+                    # instead of stopping the trial.
+                    run_iperf(
+                        CFG.IPERF_INITIAL_BANDWIDTH,
+                        CFG.IPERF_INITIAL_SECONDS,
+                        str(iperf_log),
+                        "iperf3-20M-90s",
+                    )
 
                     if not monitor.both():
                         print(
