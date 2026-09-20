@@ -723,10 +723,17 @@ def run_server():
     if not CFG.EXPERIMENTS:
         raise RuntimeError("No experiments configured")
 
-    first_name = CFG.EXPERIMENTS[0]["name"]
-    iperf_server_log = (Path(video_cwd) / first_name / CFG.RUNNER_LOG_SUBDIR
-                         / "iperf3-server.log")
-    start_iperf_server(iperf_server_log)
+    if CFG.START_IPERF_SERVER:
+        first_name = CFG.EXPERIMENTS[0]["name"]
+        iperf_server_log = (Path(video_cwd) / first_name / CFG.RUNNER_LOG_SUBDIR
+                             / "iperf3-server.log")
+        start_iperf_server(iperf_server_log)
+    else:
+        print(
+            f"[runner] START_IPERF_SERVER is False; assuming an iperf3 "
+            f"server is already running on port {CFG.IPERF_PORT}",
+            flush=True,
+        )
 
     control = ControlServer("0.0.0.0", CFG.CONTROL_PORT)
     control.start()
