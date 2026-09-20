@@ -27,6 +27,7 @@ UDP CFG.IPERF_PORT.
 """
 
 import argparse
+import datetime
 import importlib.util
 import os
 import re
@@ -74,6 +75,25 @@ log_threads = []
 
 def expand(path):
     return os.path.abspath(os.path.expanduser(path))
+
+
+def now_iso():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def strip_ansi(text):
+    return ANSI_RE.sub("", text)
+
+
+# Best-effort request to disable ANSI color in subprocess output. Rust's
+# env_logger (used by the tunnel binaries) honors RUST_LOG_STYLE; NO_COLOR
+# and CLICOLOR cover most other CLI tools. Logs are also stripped of any
+# ANSI that gets through anyway (see strip_ansi / tee_process_output),
+# since not every tool respects these.
+NO_COLOR_ENV = {"NO_COLOR": "1", "RUST_LOG_STYLE": "never", "CLICOLOR": "0"}
 
 
 def unregister(proc):
@@ -139,23 +159,31 @@ signal.signal(signal.SIGTERM, on_signal)
 # Logging
 # ---------------------------------------------------------------------------
 
-def tee_process_output(proc, log_file, prefix="", monitor=None):
+def tee_process_output(proc, log_file, prefix="", monitor=None, name="process"):
     """
     Drain a process's stdout/stderr, save it, optionally feed an
     InferredMonitor, and print it. Prevents subprocess pipes from filling
     (which is what silently stalls a process whose output nobody reads).
+    Strips ANSI color codes before writing/matching, and brackets the log
+    with explicit start/stop timestamps so a truncated or crashed run is
+    easy to bound just by reading the file.
     """
     def worker():
         try:
             with open(log_file, "a", buffering=1) as f:
+                f.write(f"=== {name} started {now_iso()} (pid {proc.pid}) ===\n")
                 for line in iter(proc.stdout.readline, ""):
                     if not line:
                         break
+                    line = strip_ansi(line)
                     f.write(line)
                     f.flush()
                     if monitor is not None:
                         monitor.feed(line)
                     print(f"{prefix}{line}", end="", flush=True)
+                rc = proc.poll()
+                rc_str = str(rc) if rc is not None else "unknown (stdout closed, process still alive)"
+                f.write(f"=== {name} stdout closed {now_iso()} (exit code {rc_str}) ===\n")
         except Exception as e:
             print(f"[runner] log thread error ({prefix.strip()}): {e}",
                   flush=True)
@@ -171,6 +199,7 @@ def start_logged(cmd, cwd=None, log_file=None, env=None, name="process",
     print("         " + " ".join(shlex.quote(str(x)) for x in cmd), flush=True)
 
     merged_env = os.environ.copy()
+    merged_env.update(NO_COLOR_ENV)
     if env:
         merged_env.update(env)
 
@@ -188,7 +217,8 @@ def start_logged(cmd, cwd=None, log_file=None, env=None, name="process",
 
     if log_file:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        tee_process_output(proc, log_file, prefix=f"[{name}] ", monitor=monitor)
+        tee_process_output(proc, log_file, prefix=f"[{name}] ", monitor=monitor,
+                            name=name)
 
     return proc
 
@@ -203,6 +233,7 @@ def run_command(cmd, cwd=None, timeout=None, log_file=None, env=None,
     print("         " + " ".join(shlex.quote(str(x)) for x in cmd), flush=True)
 
     merged_env = os.environ.copy()
+    merged_env.update(NO_COLOR_ENV)
     if env:
         merged_env.update(env)
 
@@ -210,6 +241,7 @@ def run_command(cmd, cwd=None, timeout=None, log_file=None, env=None,
     if log_file:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         log_fh = open(log_file, "a", buffering=1)
+        log_fh.write(f"=== {name} started {now_iso()} ===\n")
 
     proc = subprocess.Popen(
         cmd,
@@ -229,6 +261,7 @@ def run_command(cmd, cwd=None, timeout=None, log_file=None, env=None,
             for line in iter(proc.stdout.readline, ""):
                 if not line:
                     break
+                line = strip_ansi(line)
                 output.append(line)
                 if log_fh:
                     log_fh.write(line)
@@ -262,6 +295,7 @@ def run_command(cmd, cwd=None, timeout=None, log_file=None, env=None,
             rc = -1
 
     if log_fh:
+        log_fh.write(f"=== {name} ended {now_iso()} (exit code {rc}) ===\n")
         log_fh.close()
 
     unregister(proc)
