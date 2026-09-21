@@ -17,22 +17,26 @@ escalation of its own.
 Start the server first, then the client (manually, roughly together).
 
 The server is assumed to already be running `iperf3 -s -p CFG.IPERF_PORT`
-all the time, independently of this runner -- the runner never starts or
-stops it.
+all the time (e.g. as a daemon), independently of this runner -- the
+runner never starts or stops it.
 
 serve.py (the sidecar) is started once on the client, right at the start
 of the run, after its usual warmup pause -- and is left running for the
 entire duration of the run (every experiment, every trial), only being
 stopped at the very end during cleanup.
 
-Per trial: if the experiment's needs_inferred is true, run 20 Mbps iperf3
-for IPERF_INITIAL_SECONDS (2 minutes) first. There is no longer any check
-of the sidecar's output for "Inferred starlink/path=0" /
-"Inferred quectel/path=1" -- the 2 minutes is simply assumed to be enough
-for both links to be inferred. If needs_inferred is false, skip the 20
-Mbps phase entirely. Either way, IPERF_HIGH_BANDWIDTH for
-IPERF_HIGH_SECONDS always runs right before the video app, for every
-experiment.
+Per EXPERIMENT (not per trial):
+  1. Both sides restart their tunnel with the experiment's config.
+  2. Client runs the iperf warm-up ONCE:
+       - if the experiment's needs_inferred is true: 20 Mbps iperf3 for
+         IPERF_INITIAL_SECONDS (2 minutes) first (assumed to be enough for
+         both links to be inferred -- the sidecar output is not checked);
+       - then IPERF_HIGH_BANDWIDTH for IPERF_HIGH_SECONDS, always.
+     Each iperf3 run is retried a few times if it fails to start (the
+     iperf3 server can still be finishing the previous test, which shows
+     up as "unable to send control message: Broken pipe").
+  3. Client tells the server WARMUP_DONE, then all trials run back to back
+     (BETWEEN_TRIALS_SECONDS apart) with NO iperf in between.
 
 The control channel is TCP CONTROL_PORT (config). iperf3 is separate,
 UDP CFG.IPERF_PORT.
@@ -585,15 +589,61 @@ def iperf_command(bandwidth, seconds):
     ]
 
 
-def run_iperf(bandwidth, seconds, log_file, label):
-    rc, _ = run_command(
-        iperf_command(bandwidth, seconds),
-        timeout=seconds + 30,
-        log_file=log_file,
-        name=label,
-        check=True,
-    )
-    return rc
+def run_iperf(bandwidth, seconds, log_file, label, alive_check=None):
+    """
+    Run one iperf3 client test, retrying on failure.
+
+    iperf3 servers handle one test at a time. Right after a previous test
+    ends (or right after a tunnel restart) the server can drop a new
+    control connection mid-handshake, which shows up as
+    "iperf3: error - unable to send control message: Broken pipe".
+    That's transient, so wait a few seconds and try again instead of
+    killing the whole run.
+
+    alive_check: optional callable returning False if retrying is pointless
+    (e.g. the tunnel-client process died). Then we fail immediately.
+    """
+    attempts = max(1, int(getattr(CFG, "IPERF_RETRIES", 5)))
+    retry_delay = getattr(CFG, "IPERF_RETRY_DELAY_SECONDS", 10)
+    last_error = "unknown"
+
+    for attempt in range(1, attempts + 1):
+        try:
+            rc, _ = run_command(
+                iperf_command(bandwidth, seconds),
+                timeout=seconds + 30,
+                log_file=log_file,
+                name=label,
+                check=False,
+            )
+            if rc == 0:
+                if attempt > 1:
+                    print(f"[runner] {label} succeeded on attempt {attempt}",
+                          flush=True)
+                return rc
+            last_error = f"exit code {rc}"
+        except RuntimeError as e:
+            if stop_event.is_set():
+                raise  # genuine shutdown -- don't retry
+            last_error = str(e)
+
+        print(
+            f"[runner] {label} failed (attempt {attempt}/{attempts}): "
+            f"{last_error}",
+            flush=True,
+        )
+
+        if alive_check is not None and not alive_check():
+            raise RuntimeError(
+                f"{label} failed and the tunnel process is no longer "
+                "running; not retrying"
+            )
+
+        if attempt < attempts:
+            print(f"[runner] retrying {label} in {retry_delay}s", flush=True)
+            wait_or_stop(retry_delay)
+
+    raise RuntimeError(f"{label} failed after {attempts} attempts: {last_error}")
 
 
 # ---------------------------------------------------------------------------
@@ -699,9 +749,7 @@ def run_server():
     try:
         # Deliberately NOT starting the first tunnel here. It only starts
         # once the client has connected and is about to start its own --
-        # see the unified per-experiment block below. Starting it earlier
-        # meant it sat running (and logging) through the client's route
-        # check, sidecar 60s warmup, and connection retries for no reason.
+        # see the unified per-experiment block below.
         conn = control.accept()
 
         hello = conn.recv_line(timeout=120)
@@ -721,8 +769,7 @@ def run_server():
             # stop-old / start-new handshake. For the first experiment
             # there's nothing to stop on either side -- the client's ack
             # is immediate -- but this keeps the tunnel's lifetime tightly
-            # bound to "right before it's actually used" instead of
-            # "for the whole run".
+            # bound to "right before it's actually used".
             warn_if_stale_trial_dirs(exp_dir)
             print(f"[runner] preparing server tunnel for {name}", flush=True)
 
@@ -749,6 +796,17 @@ def run_server():
 
             conn.send_line(f"SERVER_TUNNEL_STARTED:{name}")
 
+            # The client now runs this experiment's iperf warm-up (ONCE per
+            # experiment, with retries). The server has nothing to do
+            # meanwhile except wait for the client to report it's done.
+            msg = conn.recv_line(
+                timeout=getattr(CFG, "WARMUP_TIMEOUT_SECONDS", 3600)
+            )
+            if msg != f"WARMUP_DONE:{name}":
+                raise RuntimeError(
+                    f"Expected WARMUP_DONE for {name}, got {msg}"
+                )
+
             for trial in range(1, trials + 1):
                 trial_log_dir = log_root / str(trial)
                 trial_log_dir.mkdir(parents=True, exist_ok=True)
@@ -770,7 +828,7 @@ def run_server():
                     cwd=video_cwd,
                     log_file=str(receiver_log),
                     name="receiver.py",
-                        )
+                )
 
                 wait_or_stop(1.0)
                 conn.send_line(f"RECEIVER_STARTED:{name}:{trial}")
@@ -908,6 +966,48 @@ def run_client():
                     f"{tunnel_proc.returncode}"
                 )
 
+            # ------------------------------------------------------------
+            # iperf warm-up: runs ONCE per experiment, right after the
+            # tunnel comes up -- NOT before every trial. Lives next to the
+            # tunnel logs (trial "1" dir) since it belongs to the
+            # experiment as a whole.
+            # ------------------------------------------------------------
+            iperf_log = first_log_dir / "iperf.log"
+            tunnel_alive = lambda p=tunnel_proc: p.poll() is None
+
+            if needs_inferred:
+                # No watching of the sidecar's output -- just a fixed
+                # low-rate run, assumed long enough for both links to be
+                # inferred.
+                run_iperf(
+                    CFG.IPERF_INITIAL_BANDWIDTH,
+                    CFG.IPERF_INITIAL_SECONDS,
+                    str(iperf_log),
+                    "iperf3-20M-2min",
+                    alive_check=tunnel_alive,
+                )
+                # Give the iperf3 server a moment to finish the previous
+                # test and go back to idle before the next connect. (This
+                # gap is exactly what was missing when it crashed with
+                # "unable to send control message: Broken pipe".)
+                wait_or_stop(getattr(CFG, "IPERF_GAP_SECONDS", 5))
+
+            # Always required once per experiment, immediately before the
+            # trials (needs_inferred or not).
+            run_iperf(
+                CFG.IPERF_HIGH_BANDWIDTH,
+                CFG.IPERF_HIGH_SECONDS,
+                str(iperf_log),
+                "iperf3-140M-30s",
+                alive_check=tunnel_alive,
+            )
+
+            wait_or_stop(CFG.WAIT_AFTER_HIGH_IPERF_SECONDS)
+            conn.send_line(f"WARMUP_DONE:{name}")
+
+            # ------------------------------------------------------------
+            # Trials: back to back, NO iperf in here.
+            # ------------------------------------------------------------
             for trial in range(1, trials + 1):
                 trial_log_dir = log_root / str(trial)
                 trial_log_dir.mkdir(parents=True, exist_ok=True)
@@ -923,34 +1023,6 @@ def run_client():
                     raise RuntimeError(
                         f"Expected TRIAL_READY for {name}/{trial}, got {msg}"
                     )
-
-                iperf_log = trial_log_dir / "iperf.log"
-
-                if needs_inferred:
-                    # No more watching the sidecar's output for the
-                    # "Inferred starlink/path=0" / "Inferred quectel/
-                    # path=1" lines -- we just run the low-rate iperf for
-                    # a fixed CFG.IPERF_INITIAL_SECONDS (2 minutes) and
-                    # assume that's enough for both links to be inferred.
-                    run_iperf(
-                        CFG.IPERF_INITIAL_BANDWIDTH,
-                        CFG.IPERF_INITIAL_SECONDS,
-                        str(iperf_log),
-                        "iperf3-20M-2min",
-                    )
-                # else: skip the 20M pre-iperf entirely (per spec) and go
-                # straight to the required high-rate iperf below.
-
-                # Always required immediately before the application, for
-                # every experiment (needs_inferred or not).
-                run_iperf(
-                    CFG.IPERF_HIGH_BANDWIDTH,
-                    CFG.IPERF_HIGH_SECONDS,
-                    str(iperf_log),
-                    "iperf3-140M-30s",
-                )
-
-                wait_or_stop(CFG.WAIT_AFTER_HIGH_IPERF_SECONDS)
 
                 conn.send_line(f"START_RECEIVER:{name}:{trial}")
 
