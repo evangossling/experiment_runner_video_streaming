@@ -16,13 +16,23 @@ escalation of its own.
 
 Start the server first, then the client (manually, roughly together).
 
+The server is assumed to already be running `iperf3 -s -p CFG.IPERF_PORT`
+all the time, independently of this runner -- the runner never starts or
+stops it.
+
+serve.py (the sidecar) is started once on the client, right at the start
+of the run, after its usual warmup pause -- and is left running for the
+entire duration of the run (every experiment, every trial), only being
+stopped at the very end during cleanup.
+
 Per trial: if the experiment's needs_inferred is true, run 20 Mbps iperf3
-for IPERF_INITIAL_SECONDS while watching the sidecar's output for both
-"Inferred starlink/path=0" and "Inferred quectel/path=1"; if either is
-still missing, run IPERF_EXTRA_SECONDS more, then error out if still
-missing. If needs_inferred is false, skip the 20 Mbps phase entirely.
-Either way, IPERF_HIGH_BANDWIDTH for IPERF_HIGH_SECONDS always runs right
-before the video app.
+for IPERF_INITIAL_SECONDS (2 minutes) first. There is no longer any check
+of the sidecar's output for "Inferred starlink/path=0" /
+"Inferred quectel/path=1" -- the 2 minutes is simply assumed to be enough
+for both links to be inferred. If needs_inferred is false, skip the 20
+Mbps phase entirely. Either way, IPERF_HIGH_BANDWIDTH for
+IPERF_HIGH_SECONDS always runs right before the video app, for every
+experiment.
 
 The control channel is TCP CONTROL_PORT (config). iperf3 is separate,
 UDP CFG.IPERF_PORT.
@@ -163,8 +173,8 @@ signal.signal(signal.SIGTERM, on_signal)
 
 def tee_process_output(proc, log_file, prefix="", monitor=None, name="process"):
     """
-    Drain a process's stdout/stderr, save it, optionally feed an
-    InferredMonitor, and print it. Prevents subprocess pipes from filling
+    Drain a process's stdout/stderr, save it, optionally feed a line
+    monitor callback object, and print it. Prevents subprocess pipes from filling
     (which is what silently stalls a process whose output nobody reads).
     Strips ANSI color codes before writing/matching, and brackets the log
     with explicit start/stop timestamps so a truncated or crashed run is
@@ -537,41 +547,6 @@ def server_tunnel_command(exp):
 
 
 # ---------------------------------------------------------------------------
-# Inferred monitoring
-#
-# ASSUMPTION: the "Inferred starlink/path=0 ..." / "Inferred quectel/path=1
-# ..." lines are emitted by the sidecar (serve.py), not the tunnel-client
-# process -- confirmed correct in testing. This watches the sidecar's
-# stdout for them.
-# ---------------------------------------------------------------------------
-
-class InferredMonitor:
-    STARLINK_RE = re.compile(r"Inferred\s+starlink/path=0\b")
-    QUECTEL_RE = re.compile(r"Inferred\s+quectel/path=1\b")
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.starlink = False
-        self.quectel = False
-
-    def feed(self, line):
-        with self.lock:
-            if self.STARLINK_RE.search(line):
-                self.starlink = True
-            if self.QUECTEL_RE.search(line):
-                self.quectel = True
-
-    def both(self):
-        with self.lock:
-            return self.starlink and self.quectel
-
-    def reset(self):
-        with self.lock:
-            self.starlink = False
-            self.quectel = False
-
-
-# ---------------------------------------------------------------------------
 # Sidecar (client only)
 # ---------------------------------------------------------------------------
 
@@ -586,15 +561,13 @@ def start_sidecar(log_file):
     if not Path(python).exists():
         raise RuntimeError(f"Sidecar venv Python not found: {python}")
 
-    monitor = InferredMonitor()
     proc = start_logged(
         [python, script],
         cwd=sidecar_dir,
         log_file=str(log_file),
         name="serve.py",
-        monitor=monitor,
     )
-    return proc, monitor
+    return proc
 
 
 # ---------------------------------------------------------------------------
@@ -662,20 +635,6 @@ def check_server_disk_space():
         )
 
 
-def start_iperf_server(log_file):
-    """
-    iperf3 -s -p CFG.IPERF_PORT. Binds 0.0.0.0, so it doesn't need tun0 to
-    exist yet and doesn't need restarting when the tunnel restarts between
-    experiments -- started once, lives for the whole run, torn down by
-    cleanup() like everything else in `processes`.
-    """
-    return start_logged(
-        ["iperf3", "-s", "-p", str(CFG.IPERF_PORT)],
-        log_file=str(log_file),
-        name="iperf3-server",
-    )
-
-
 def warn_if_stale_trial_dirs(exp_dir):
     """
     receiver.py picks its own numbered output folder based on what already
@@ -717,23 +676,20 @@ def server_receiver_command(experiment_name):
 def run_server():
     check_server_disk_space()
 
+    # iperf3 -s on CFG.IPERF_PORT is assumed to already be running on the
+    # server all the time (started independently of this runner, outside
+    # its process lifecycle), so it is neither started nor cleaned up here.
+    print(
+        f"[runner] assuming an iperf3 server is already running on port "
+        f"{CFG.IPERF_PORT} (started independently of this runner)",
+        flush=True,
+    )
+
     tunnel_cwd = expand(CFG.SERVER_TUNNEL_DIR)
     video_cwd = expand(CFG.VIDEO_APP_DIR)
 
     if not CFG.EXPERIMENTS:
         raise RuntimeError("No experiments configured")
-
-    if CFG.START_IPERF_SERVER:
-        first_name = CFG.EXPERIMENTS[0]["name"]
-        iperf_server_log = (Path(video_cwd) / first_name / CFG.RUNNER_LOG_SUBDIR
-                             / "iperf3-server.log")
-        start_iperf_server(iperf_server_log)
-    else:
-        print(
-            f"[runner] START_IPERF_SERVER is False; assuming an iperf3 "
-            f"server is already running on port {CFG.IPERF_PORT}",
-            flush=True,
-        )
 
     control = ControlServer("0.0.0.0", CFG.CONTROL_PORT)
     control.start()
@@ -885,7 +841,11 @@ def run_client():
     sidecar_log = (Path(video_cwd) / first_name / CFG.RUNNER_LOG_SUBDIR
                    / "sidecar.log")
 
-    sidecar, monitor = start_sidecar(sidecar_log)
+    # serve.py is started once and runs for the entire duration of the run
+    # (all experiments, all trials) -- it is only stopped by cleanup() at
+    # the very end. It still gets its warmup pause right here, before
+    # anything else on the client starts.
+    sidecar = start_sidecar(sidecar_log)
     print(
         f"[runner] sidecar started; waiting {CFG.SIDECAR_STARTUP_SECONDS}s "
         "before use",
@@ -939,8 +899,6 @@ def run_client():
 
             first_log_dir = log_root / "1"
             first_log_dir.mkdir(parents=True, exist_ok=True)
-            if needs_inferred:
-                monitor.reset()
             tunnel_proc = start_client_tunnel(exp, first_log_dir)
 
             wait_or_stop(2)
@@ -969,42 +927,22 @@ def run_client():
                 iperf_log = trial_log_dir / "iperf.log"
 
                 if needs_inferred:
-                    # The 90s iperf always runs in full (no early exit).
-                    # If both Inferred lines are still missing afterward,
-                    # run an additional 60s. run_iperf() (via run_command)
-                    # already enforces its own timeout and honors
-                    # stop_event, so this runs directly on the main thread
-                    # -- a hang/failure here raises and aborts the trial
-                    # rather than being silently swallowed.
+                    # No more watching the sidecar's output for the
+                    # "Inferred starlink/path=0" / "Inferred quectel/
+                    # path=1" lines -- we just run the low-rate iperf for
+                    # a fixed CFG.IPERF_INITIAL_SECONDS (2 minutes) and
+                    # assume that's enough for both links to be inferred.
                     run_iperf(
                         CFG.IPERF_INITIAL_BANDWIDTH,
                         CFG.IPERF_INITIAL_SECONDS,
                         str(iperf_log),
-                        "iperf3-20M-90s",
+                        "iperf3-20M-2min",
                     )
-
-                    if not monitor.both():
-                        print(
-                            "[runner] both Inferred lines still missing "
-                            "after 90s; running 60s more at 20M",
-                            flush=True,
-                        )
-                        run_iperf(
-                            CFG.IPERF_INITIAL_BANDWIDTH,
-                            CFG.IPERF_EXTRA_SECONDS,
-                            str(iperf_log),
-                            "iperf3-20M-60s",
-                        )
-
-                    if not monitor.both():
-                        raise RuntimeError(
-                            f"Both Inferred lines were not observed for "
-                            f"experiment {name} after 150s of 20M pre-iperf."
-                        )
                 # else: skip the 20M pre-iperf entirely (per spec) and go
                 # straight to the required high-rate iperf below.
 
-                # Always required immediately before the application.
+                # Always required immediately before the application, for
+                # every experiment (needs_inferred or not).
                 run_iperf(
                     CFG.IPERF_HIGH_BANDWIDTH,
                     CFG.IPERF_HIGH_SECONDS,
