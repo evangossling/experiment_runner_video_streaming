@@ -138,14 +138,14 @@ SIDECAR_PROVIDERS_ARGS = (
 EXPERIMENTS = [
 
     {
-        "name": "9_qoepredictive",
+        "name": "11_qoepredictive",
         "trials": 11,
         "client_tunnel_args": f"--packet-scheduler qoepredictive --path-model sidecar --prediction-mode static {SIDECAR_PROVIDERS_ARGS} --fec --fec-profile p30",
         "server_tunnel_args": "--fec --fec-profile p30",
         "needs_inferred": True,
     },
     {
-        "name": "10_qoepredictive_fec",
+        "name": "12_qoepredictive_fec",
         "trials": 11,
         "client_tunnel_args": f"--packet-scheduler qoepredictive --path-model sidecar --prediction-mode static {SIDECAR_PROVIDERS_ARGS} --fec --fec-profile p30",
         "server_tunnel_args": "--fec --fec-profile p30",
@@ -180,14 +180,14 @@ EXPERIMENTS = [
         "needs_inferred": False,
     },
     {
-        "name": "7_predictiveminrtt",
+        "name": "9_predictiveminrtt",
         "trials": 11,
         "client_tunnel_args": f"--packet-scheduler predictiveminrtt --path-model sidecar --prediction-mode static {SIDECAR_PROVIDERS_ARGS}",
         "server_tunnel_args": "",
         "needs_inferred": True,
     },
     {
-        "name": "8_predictiveminrtt_fec",
+        "name": "10_predictiveminrtt_fec",
         "trials": 11,
         "client_tunnel_args": f"--packet-scheduler predictiveminrtt --path-model sidecar --prediction-mode static {SIDECAR_PROVIDERS_ARGS} --fec --fec-profile p30",
         "server_tunnel_args": "--fec --fec-profile p30",
@@ -201,7 +201,7 @@ EXPERIMENTS = [
         "needs_inferred": True,
     },
     {
-        "name": "6_modelminrtt_fec",
+        "name": "8_modelminrtt_fec",
         "trials": 11,
         "client_tunnel_args": f"--packet-scheduler modelminrtt --path-model sidecar --prediction-mode static {SIDECAR_PROVIDERS_ARGS} --fec --fec-profile p30",
         "server_tunnel_args": "--fec --fec-profile p30",
