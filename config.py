@@ -90,7 +90,7 @@ IPERF_HIGH_BANDWIDTH = "140M"
 IPERF_HIGH_SECONDS = 30
 # UDP payload per iperf3 packet. The default (1460) is larger than the
 # tunnel's MTU (1306, or 1297 with FEC), so each packet would be split in two
-# inside the tunnel.
+# inside the tunnel. Set to None to use iperf3's default.
 IPERF_LENGTH = 1200
 # The iperf3 server can still be finishing one test when the next starts and
 # rejects it as busy. The runner then waits and retries this many times.

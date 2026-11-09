@@ -647,35 +647,60 @@ def start_sidecar(log_file):
 # ---------------------------------------------------------------------------
 
 def iperf_command(bandwidth, seconds):
-    return [
+    # stdbuf: iperf3 buffers its output when not writing to a terminal, so
+    # without it the log stops short of where a stuck run really is.
+    cmd = [
+        "stdbuf", "-oL",
         "iperf3",
         "-c", CFG.IPERF_SERVER,
         "-p", str(CFG.IPERF_PORT),
         "-u",
         "-b", str(bandwidth),
-        "-l", str(CFG.IPERF_LENGTH),
         "-t", str(seconds),
     ]
+    if CFG.IPERF_LENGTH:
+        cmd += ["-l", str(CFG.IPERF_LENGTH)]
+    return cmd
 
 
 def run_iperf(bandwidth, seconds, log_file, label):
     """
-    Runs one iperf3 test. If the server rejects it as busy (it can still be
-    finishing the previous test when the next one starts), waits and retries
-    up to CFG.IPERF_BUSY_RETRIES times. Any other failure raises.
+    Runs one iperf3 test, which is only there to load the links.
+
+    - The server rejects it as busy (it can still be finishing the previous
+      test): waits and retries up to CFG.IPERF_BUSY_RETRIES times.
+    - It fails or hangs only after running its full duration (e.g. waiting
+      for the server's results): the links were loaded, so it warns and
+      returns.
+    - Any other failure raises.
     """
     for attempt in range(CFG.IPERF_BUSY_RETRIES + 1):
-        rc, output = run_command(
-            iperf_command(bandwidth, seconds),
-            timeout=seconds + 30,
-            log_file=log_file,
-            name=label,
-            check=False,
-        )
+        started = time.monotonic()
+        try:
+            rc, output = run_command(
+                iperf_command(bandwidth, seconds),
+                timeout=seconds + 30,
+                log_file=log_file,
+                name=label,
+                check=False,
+            )
+        except RuntimeError as e:
+            if stop_event.is_set():
+                raise
+            rc, output = None, str(e)
         if rc == 0:
             return rc
+        ran = time.monotonic() - started
+        if ran >= seconds:
+            print(
+                f"[runner] WARNING: {label} failed after {ran:.0f}s "
+                f"({output.strip().splitlines()[-1] if output.strip() else rc}); "
+                "the links were loaded for the full test, so continuing",
+                flush=True,
+            )
+            return rc
         if "server is busy" not in output or attempt == CFG.IPERF_BUSY_RETRIES:
-            raise RuntimeError(f"{label} exited with code {rc}")
+            raise RuntimeError(f"{label} failed after {ran:.0f}s (exit code {rc})")
         print(
             f"[runner] iperf3 server busy; retrying {label} in "
             f"{CFG.IPERF_BUSY_RETRY_SECONDS}s "
@@ -764,6 +789,26 @@ def warn_if_stale_trial_dirs(exp_dir):
 # ---------------------------------------------------------------------------
 # Server
 # ---------------------------------------------------------------------------
+
+def iperf_max_seconds(seconds):
+    """Longest one run_iperf call can take, including busy retries."""
+    return (seconds + 30
+            + CFG.IPERF_BUSY_RETRIES * (CFG.IPERF_BUSY_RETRY_SECONDS + 5))
+
+
+def pre_video_timeout(exp):
+    """
+    How long the server waits for the client's START_RECEIVER: the longest
+    the client's iperf phases can take, plus a margin. A fixed limit was
+    shorter than 90 s + 60 s + 30 s of iperf, so the server gave up and
+    stopped its tunnel while the client was still loading the links.
+    """
+    total = iperf_max_seconds(CFG.IPERF_HIGH_SECONDS)
+    if exp.get("needs_inferred", False):
+        total += iperf_max_seconds(CFG.IPERF_INITIAL_SECONDS)
+        total += iperf_max_seconds(CFG.IPERF_EXTRA_SECONDS)
+    return total + CFG.WAIT_AFTER_HIGH_IPERF_SECONDS + 60
+
 
 def server_receiver_command(experiment_name):
     cmd = [
@@ -864,7 +909,7 @@ def run_server():
 
                 conn.send_line(f"TRIAL_READY:{name}:{trial}")
 
-                msg = conn.recv_line(timeout=180)
+                msg = conn.recv_line(timeout=pre_video_timeout(exp))
                 if msg != f"START_RECEIVER:{name}:{trial}":
                     raise RuntimeError(
                         f"Expected START_RECEIVER for {name}/{trial}, got {msg}"
