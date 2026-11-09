@@ -92,6 +92,10 @@ IPERF_HIGH_SECONDS = 30
 # tunnel's MTU (1306, or 1297 with FEC), so each packet would be split in two
 # inside the tunnel.
 IPERF_LENGTH = 1200
+# The iperf3 server can still be finishing one test when the next starts and
+# rejects it as busy. The runner then waits and retries this many times.
+IPERF_BUSY_RETRIES = 5
+IPERF_BUSY_RETRY_SECONDS = 2
 
 # Tunnel trace (--trace-file / --trace-level), one file per experiment and
 # side, in ~/video_streaming_app/<name>/run_logs/. The tunnel runs for a whole

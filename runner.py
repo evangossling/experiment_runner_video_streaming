@@ -659,14 +659,30 @@ def iperf_command(bandwidth, seconds):
 
 
 def run_iperf(bandwidth, seconds, log_file, label):
-    rc, _ = run_command(
-        iperf_command(bandwidth, seconds),
-        timeout=seconds + 30,
-        log_file=log_file,
-        name=label,
-        check=True,
-    )
-    return rc
+    """
+    Runs one iperf3 test. If the server rejects it as busy (it can still be
+    finishing the previous test when the next one starts), waits and retries
+    up to CFG.IPERF_BUSY_RETRIES times. Any other failure raises.
+    """
+    for attempt in range(CFG.IPERF_BUSY_RETRIES + 1):
+        rc, output = run_command(
+            iperf_command(bandwidth, seconds),
+            timeout=seconds + 30,
+            log_file=log_file,
+            name=label,
+            check=False,
+        )
+        if rc == 0:
+            return rc
+        if "server is busy" not in output or attempt == CFG.IPERF_BUSY_RETRIES:
+            raise RuntimeError(f"{label} exited with code {rc}")
+        print(
+            f"[runner] iperf3 server busy; retrying {label} in "
+            f"{CFG.IPERF_BUSY_RETRY_SECONDS}s "
+            f"({attempt + 1}/{CFG.IPERF_BUSY_RETRIES})",
+            flush=True,
+        )
+        wait_or_stop(CFG.IPERF_BUSY_RETRY_SECONDS)
 
 
 # ---------------------------------------------------------------------------
