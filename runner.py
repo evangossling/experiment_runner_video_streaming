@@ -663,18 +663,29 @@ def iperf_command(bandwidth, seconds):
     return cmd
 
 
+def note_trial(trial_log_dir, message):
+    """Prints a warning and records it in the trial's trial_info.txt."""
+    print(f"[runner] WARNING: {message}", flush=True)
+    with open(Path(trial_log_dir) / "trial_info.txt", "a") as f:
+        f.write(f"warning={now_iso()} {message}\n")
+
+
 def run_iperf(bandwidth, seconds, log_file, label):
     """
-    Runs one iperf3 test, which is only there to load the links.
+    Runs one iperf3 test, which only loads the links. Never stops the
+    experiment: returns True if the links were loaded for the full test,
+    False (with a warning in trial_info.txt) if every attempt failed.
 
-    - The server rejects it as busy (it can still be finishing the previous
-      test): waits and retries up to CFG.IPERF_BUSY_RETRIES times.
-    - It fails or hangs only after running its full duration (e.g. waiting
-      for the server's results): the links were loaded, so it warns and
-      returns.
-    - Any other failure raises.
+    Each attempt waits CFG.IPERF_PAUSE_SECONDS first, so the iperf3 server
+    has finished the previous test; starting the next one immediately makes
+    it hang up ("server is busy", "Broken pipe"). A failure before the full
+    test time is retried up to CFG.IPERF_RETRIES times, whatever the error. A
+    failure after it (e.g. waiting for the server's results) counts as done.
     """
-    for attempt in range(CFG.IPERF_BUSY_RETRIES + 1):
+    trial_log_dir = Path(log_file).parent
+    last_error = ""
+    for attempt in range(CFG.IPERF_RETRIES + 1):
+        wait_or_stop(CFG.IPERF_PAUSE_SECONDS)
         started = time.monotonic()
         try:
             rc, output = run_command(
@@ -689,25 +700,22 @@ def run_iperf(bandwidth, seconds, log_file, label):
                 raise
             rc, output = None, str(e)
         if rc == 0:
-            return rc
+            return True
         ran = time.monotonic() - started
+        lines = output.strip().splitlines()
+        last_error = lines[-1] if lines else f"exit code {rc}"
         if ran >= seconds:
-            print(
-                f"[runner] WARNING: {label} failed after {ran:.0f}s "
-                f"({output.strip().splitlines()[-1] if output.strip() else rc}); "
-                "the links were loaded for the full test, so continuing",
-                flush=True,
-            )
-            return rc
-        if "server is busy" not in output or attempt == CFG.IPERF_BUSY_RETRIES:
-            raise RuntimeError(f"{label} failed after {ran:.0f}s (exit code {rc})")
-        print(
-            f"[runner] iperf3 server busy; retrying {label} in "
-            f"{CFG.IPERF_BUSY_RETRY_SECONDS}s "
-            f"({attempt + 1}/{CFG.IPERF_BUSY_RETRIES})",
-            flush=True,
-        )
-        wait_or_stop(CFG.IPERF_BUSY_RETRY_SECONDS)
+            note_trial(trial_log_dir,
+                       f"{label} failed after the full {seconds}s test "
+                       f"({last_error}); the links were loaded, continuing")
+            return True
+        if attempt < CFG.IPERF_RETRIES:
+            print(f"[runner] {label} failed after {ran:.0f}s ({last_error}); "
+                  f"retrying ({attempt + 1}/{CFG.IPERF_RETRIES})", flush=True)
+    note_trial(trial_log_dir,
+               f"{label} failed {CFG.IPERF_RETRIES + 1} times ({last_error}); "
+               "continuing without it")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -791,9 +799,8 @@ def warn_if_stale_trial_dirs(exp_dir):
 # ---------------------------------------------------------------------------
 
 def iperf_max_seconds(seconds):
-    """Longest one run_iperf call can take, including busy retries."""
-    return (seconds + 30
-            + CFG.IPERF_BUSY_RETRIES * (CFG.IPERF_BUSY_RETRY_SECONDS + 5))
+    """Longest one run_iperf call can take, with every retry."""
+    return (CFG.IPERF_RETRIES + 1) * (CFG.IPERF_PAUSE_SECONDS + seconds + 30)
 
 
 def pre_video_timeout(exp):
@@ -1121,10 +1128,12 @@ def run_client():
                                      t0, time.time())
 
                     if not monitor.both():
-                        raise RuntimeError(
-                            f"Both Inferred lines were not observed for "
-                            f"experiment {name} after 150s of 20M pre-iperf."
-                        )
+                        # The scheduler falls back to live measurements
+                        # without predictions, so the trial still runs.
+                        note_trial(trial_log_dir,
+                                   "sidecar predictions for both paths not "
+                                   "seen after the 20M phases; running the "
+                                   "trial anyway")
                 # else: skip the 20M pre-iperf entirely (per spec) and go
                 # straight to the required high-rate iperf below.
 
