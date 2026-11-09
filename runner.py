@@ -38,6 +38,7 @@ import argparse
 import datetime
 import importlib.util
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -82,6 +83,11 @@ log_threads = []
 
 
 def expand(path):
+    """Expands `~` to the home of the user who ran sudo, not root's."""
+    path = str(path)
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and (path == "~" or path.startswith("~/")):
+        path = pwd.getpwnam(sudo_user).pw_dir + path[1:]
     return os.path.abspath(os.path.expanduser(path))
 
 
