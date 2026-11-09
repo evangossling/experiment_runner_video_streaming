@@ -26,6 +26,12 @@ before the video app.
 
 The control channel is TCP CONTROL_PORT (config). iperf3 is separate,
 UDP CFG.IPERF_PORT.
+
+Each side traces its tunnel (CFG.TRACE_LEVEL) to
+<VIDEO_APP_DIR>/<experiment>/run_logs/{client,server}_trace.jsonl and appends
+each trial's phase times to phases.csv there, so a trace covering a whole
+experiment can be cut into trials. A rerun never overwrites an existing
+trace; it gets a numbered name instead.
 """
 
 import argparse
@@ -223,6 +229,37 @@ def start_logged(cmd, cwd=None, log_file=None, env=None, name="process",
                             name=name)
 
     return proc
+
+
+def unused_path(path):
+    """`path`, or `name_2.ext`, `name_3.ext`, ... if it already exists."""
+    path = Path(path)
+    n = 2
+    candidate = path
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}_{n}{path.suffix}")
+        n += 1
+    return candidate
+
+
+def trace_args(exp, log_root, side):
+    """--trace-file/--trace-level for this experiment, or [] if disabled."""
+    level = exp.get("trace_level", CFG.TRACE_LEVEL)
+    if not level:
+        return []
+    log_root.mkdir(parents=True, exist_ok=True)
+    trace_file = unused_path(log_root / f"{side}_trace.jsonl")
+    return ["--trace-file", str(trace_file), "--trace-level", str(level)]
+
+
+def record_phase(log_root, side, trial, phase, start, end):
+    """Appends one phase's wall-clock times (Unix seconds) to phases.csv."""
+    path = Path(log_root) / "phases.csv"
+    new = not path.exists()
+    with open(path, "a") as f:
+        if new:
+            f.write("side,trial,phase,start_unix,end_unix,duration_s\n")
+        f.write(f"{side},{trial},{phase},{start:.3f},{end:.3f},{end - start:.3f}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +539,7 @@ class ControlClient:
 # just concatenation, so any flag (including ones not seen before) works.
 # ---------------------------------------------------------------------------
 
-def client_tunnel_command(exp):
+def client_tunnel_command(exp, log_root):
     cmd = [
         "env",
         "RUST_LOG=tunnel_app::tunnel::metrics=info,tunnel_app::tunnel::control=info",
@@ -513,11 +550,12 @@ def client_tunnel_command(exp):
         "--tun-name", "tun0",
         "--multipath",
     ]
+    cmd += trace_args(exp, log_root, "client")
     cmd += shlex.split(exp.get("client_tunnel_args", "") or "")
     return cmd
 
 
-def server_tunnel_command(exp):
+def server_tunnel_command(exp, log_root):
     cmd = [
         "env",
         "RUST_LOG=tunnel_app::tunnel::metrics=info,tunnel_app::tunnel::control=info",
@@ -532,6 +570,7 @@ def server_tunnel_command(exp):
         "--initial-max-path-id", "4",
         "--packet-scheduler", "minrtt",
     ]
+    cmd += trace_args(exp, log_root, "server")
     cmd += shlex.split(exp.get("server_tunnel_args", "") or "")
     return cmd
 
@@ -608,6 +647,7 @@ def iperf_command(bandwidth, seconds):
         "-p", str(CFG.IPERF_PORT),
         "-u",
         "-b", str(bandwidth),
+        "-l", str(CFG.IPERF_LENGTH),
         "-t", str(seconds),
     ]
 
@@ -653,7 +693,7 @@ def check_server_disk_space():
     print(f"[runner] free space on {video_dir}: {free_gb:.2f} GB", flush=True)
 
     if required_gb > free_gb:
-        raise RuntimeError(
+        print(
             f"Not enough server disk space. Need approximately "
             f"{required_gb:.2f} GB for {expected_trials} saved videos, "
             f"but only {free_gb:.2f} GB is free on {video_dir}. "
@@ -708,6 +748,9 @@ def server_receiver_command(experiment_name):
         "python3", "receiver.py",
         "--port", str(CFG.RECEIVER_PORT),
         "--output", experiment_name,
+        # Exit after one stream: without it receiver.py waits for the next
+        # one and only stops when interrupted, which can cut off saving.
+        "--once",
     ]
     if CFG.RECEIVER_NO_SAVE_VIDEO:
         cmd.append("--no-save-video")
@@ -785,7 +828,7 @@ def run_server():
 
             first_log_dir = log_root / "1"
             current_tunnel = start_logged(
-                server_tunnel_command(exp),
+                server_tunnel_command(exp, log_root),
                 cwd=tunnel_cwd,
                 log_file=str(first_log_dir / "server_tunnel.log"),
                 name="tunnel-server",
@@ -806,6 +849,7 @@ def run_server():
                     )
 
                 receiver_log = trial_log_dir / "receiver.log"
+                receiver_start = time.time()
                 # NOTE: receiver.py chooses its own numbered subfolder under
                 # exp_dir (--output name). This log captures its stdout, not
                 # the video it saves.
@@ -828,10 +872,17 @@ def run_server():
                     )
 
                 try:
-                    receiver.wait(timeout=5)
+                    receiver.wait(timeout=CFG.RECEIVER_EXIT_WAIT_SECONDS)
                 except subprocess.TimeoutExpired:
+                    print(
+                        f"[runner] receiver.py still running after "
+                        f"{CFG.RECEIVER_EXIT_WAIT_SECONDS}s; stopping it",
+                        flush=True,
+                    )
                     terminate_process(receiver, "receiver.py")
                 unregister(receiver)
+                record_phase(log_root, "server", trial, "receiver",
+                             receiver_start, time.time())
 
                 if trial < trials:
                     wait_or_stop(CFG.BETWEEN_TRIALS_SECONDS)
@@ -862,8 +913,8 @@ def run_server():
 # Client
 # ---------------------------------------------------------------------------
 
-def start_client_tunnel(exp, log_dir):
-    cmd = client_tunnel_command(exp)
+def start_client_tunnel(exp, log_dir, log_root):
+    cmd = client_tunnel_command(exp, log_root)
     log_file = log_dir / "client_tunnel.log"
     return start_logged(
         cmd,
@@ -941,7 +992,7 @@ def run_client():
             first_log_dir.mkdir(parents=True, exist_ok=True)
             if needs_inferred:
                 monitor.reset()
-            tunnel_proc = start_client_tunnel(exp, first_log_dir)
+            tunnel_proc = start_client_tunnel(exp, first_log_dir, log_root)
 
             wait_or_stop(2)
             if tunnel_proc.poll() is not None:
@@ -976,12 +1027,15 @@ def run_client():
                     # stop_event, so this runs directly on the main thread
                     # -- a hang/failure here raises and aborts the trial
                     # rather than being silently swallowed.
+                    t0 = time.time()
                     run_iperf(
                         CFG.IPERF_INITIAL_BANDWIDTH,
                         CFG.IPERF_INITIAL_SECONDS,
                         str(iperf_log),
                         "iperf3-20M-90s",
                     )
+                    record_phase(log_root, "client", trial, "iperf_initial",
+                                 t0, time.time())
 
                     if not monitor.both():
                         print(
@@ -989,12 +1043,15 @@ def run_client():
                             "after 90s; running 60s more at 20M",
                             flush=True,
                         )
+                        t0 = time.time()
                         run_iperf(
                             CFG.IPERF_INITIAL_BANDWIDTH,
                             CFG.IPERF_EXTRA_SECONDS,
                             str(iperf_log),
                             "iperf3-20M-60s",
                         )
+                        record_phase(log_root, "client", trial, "iperf_extra",
+                                     t0, time.time())
 
                     if not monitor.both():
                         raise RuntimeError(
@@ -1005,12 +1062,15 @@ def run_client():
                 # straight to the required high-rate iperf below.
 
                 # Always required immediately before the application.
+                t0 = time.time()
                 run_iperf(
                     CFG.IPERF_HIGH_BANDWIDTH,
                     CFG.IPERF_HIGH_SECONDS,
                     str(iperf_log),
                     "iperf3-140M-30s",
                 )
+                record_phase(log_root, "client", trial, "iperf_high",
+                             t0, time.time())
 
                 wait_or_stop(CFG.WAIT_AFTER_HIGH_IPERF_SECONDS)
 
@@ -1034,8 +1094,12 @@ def run_client():
                     "--height", str(CFG.VIDEO_HEIGHT),
                     "--fps", str(CFG.VIDEO_FPS),
                     "--bitrate", str(CFG.VIDEO_BITRATE),
+                    "--preset", CFG.VIDEO_PRESET,
+                    # Keep the sender's numbered logs with this trial.
+                    "--log-dir", str(trial_log_dir / "sender"),
                 ]
 
+                t0 = time.time()
                 run_command(
                     sender_cmd,
                     cwd=expand(CFG.VIDEO_APP_DIR),
@@ -1044,6 +1108,7 @@ def run_client():
                     name="sender.py",
                     check=True,
                 )
+                record_phase(log_root, "client", trial, "video", t0, time.time())
 
                 conn.send_line(f"SENDER_FINISHED:{name}:{trial}")
 

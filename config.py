@@ -53,6 +53,7 @@ VIDEO_WIDTH = 3840
 VIDEO_HEIGHT = 2160
 VIDEO_FPS = 30
 VIDEO_BITRATE = 45000
+VIDEO_PRESET = "ultrafast"   # x264 speed preset passed to sender.py --preset
  
 # Where the runner puts ITS OWN logs (tunnel output, iperf.log, sender.log,
 # trial_info.txt) for each experiment/trial. Deliberately separate from
@@ -64,6 +65,11 @@ RUNNER_LOG_SUBDIR = "run_logs"
 RECEIVER_PORT = 5000
 RECEIVER_NO_SAVE_VIDEO = False
  
+# How long the server waits for receiver.py to finish saving after the video
+# ends. receiver.py runs with --once, so it exits on its own; this is only
+# the limit before the runner stops it.
+RECEIVER_EXIT_WAIT_SECONDS = 45
+
 # Estimated size of one saved received video, used only for the disk check.
 ESTIMATED_VIDEO_GB = 1.1
  
@@ -82,6 +88,18 @@ IPERF_INITIAL_SECONDS = 90
 IPERF_EXTRA_SECONDS = 60
 IPERF_HIGH_BANDWIDTH = "140M"
 IPERF_HIGH_SECONDS = 30
+# UDP payload per iperf3 packet. The default (1460) is larger than the
+# tunnel's MTU (1306, or 1297 with FEC), so each packet would be split in two
+# inside the tunnel.
+IPERF_LENGTH = 1200
+
+# Tunnel trace (--trace-file / --trace-level), one file per experiment and
+# side, in ~/video_streaming_app/<name>/run_logs/. The tunnel runs for a whole
+# experiment, so one trace covers all its trials; phases.csv in the same
+# folder gives each trial's phase times for cutting the trace. Levels:
+# summary, events, packets (very large), full. An experiment can override this
+# with its own "trace_level". Set to None to disable tracing.
+TRACE_LEVEL = "events"
  
 # Timing
 BETWEEN_TRIALS_SECONDS = 10
@@ -93,7 +111,7 @@ VIDEO_TIMEOUT_SECONDS = 125
 # Required Starlink public IP on the client.
 # The client checks:
 #   curl --interface eno4 https://api.ipify.org
-REQUIRED_STARLINK_PUBLIC_IP = "153.66.69.111"
+REQUIRED_STARLINK_PUBLIC_IP = "153.66.69.182"
  
 # ---------------------------------------------------------------------------
 # Experiments
@@ -103,6 +121,8 @@ REQUIRED_STARLINK_PUBLIC_IP = "153.66.69.111"
 #   ~/video_streaming_app/<name>/<trial>          <- receiver.py's own
 #                                                     numbered video output
 #   ~/video_streaming_app/<name>/run_logs/<trial> <- runner-authored logs
+#   ~/video_streaming_app/<name>/run_logs/         <- tunnel traces and
+#                                                     phases.csv
 #
 # client_tunnel_args / server_tunnel_args are raw strings: everything you'd
 # type after `--multipath` on the client, or after `--packet-scheduler
@@ -123,170 +143,90 @@ SIDECAR_PROVIDERS_ARGS = (
 )
 
 EXPERIMENTS = [
+    
     {
-        "name": "arrivaltime_model",
-        "trials": 10,
-        "client_tunnel_args": f"--packet-scheduler arrivaltime --path-model sidecar --prediction-mode model {SIDECAR_PROVIDERS_ARGS}",
+        "name": "11_qoepredictive_new",
+        "trials": 11,
+        "client_tunnel_args": f"--packet-scheduler qoepredictive --path-model sidecar --prediction-mode static {SIDECAR_PROVIDERS_ARGS}",
         "server_tunnel_args": "",
         "needs_inferred": True,
     },
     {
-        "name": "arrivaltime_live",
-        "trials": 10,
-        "client_tunnel_args": f"--packet-scheduler arrivaltime --path-model sidecar --prediction-mode live {SIDECAR_PROVIDERS_ARGS}",
-        "server_tunnel_args": "",
-        "needs_inferred": False,  # unconfirmed for "live"
-    },
-    {
-        "name": "arrivaltime_static",
-        "trials": 10,
-        "client_tunnel_args": f"--packet-scheduler arrivaltime --path-model sidecar --prediction-mode static {SIDECAR_PROVIDERS_ARGS}",
-        "server_tunnel_args": "",
-        "needs_inferred": True,
-    },
-    {
-        "name": "predictiveminrtt_model",
-        "trials": 10,
-        "client_tunnel_args": f"--packet-scheduler predictiveminrtt --path-model sidecar --prediction-mode model {SIDECAR_PROVIDERS_ARGS}",
-        "server_tunnel_args": "",
-        "needs_inferred": True,
-    },
-    {
-        "name": "predictiveminrtt_live",
-        "trials": 10,
-        "client_tunnel_args": f"--packet-scheduler predictiveminrtt --path-model sidecar --prediction-mode live {SIDECAR_PROVIDERS_ARGS}",
-        "server_tunnel_args": "",
-        "needs_inferred": False,  # unconfirmed for "live"
-    },
-    {
-        "name": "predictiveminrtt_static",
-        "trials": 10,
-        "client_tunnel_args": f"--packet-scheduler predictiveminrtt --path-model sidecar --prediction-mode static {SIDECAR_PROVIDERS_ARGS}",
-        "server_tunnel_args": "",
-        "needs_inferred": True,
-    },
-    {
-        "name": "arrivaltime_p30",
-        "trials": 10,
-        "client_tunnel_args": f"--packet-scheduler arrivaltime --path-model sidecar --prediction-mode static {SIDECAR_PROVIDERS_ARGS} --fec --fec-profile p30",
+        "name": "12_qoepredictive_fec_new",
+        "trials": 11,
+        "client_tunnel_args": f"--packet-scheduler qoepredictive --path-model sidecar --prediction-mode static {SIDECAR_PROVIDERS_ARGS} --fec --fec-profile p30",
         "server_tunnel_args": "--fec --fec-profile p30",
         "needs_inferred": True,
     },
     {
-        "name": "arrivaltime_p60",
-        "trials": 10,
-        "client_tunnel_args": f"--packet-scheduler arrivaltime --path-model sidecar --prediction-mode static {SIDECAR_PROVIDERS_ARGS} --fec --fec-profile p60",
-        "server_tunnel_args": "--fec --fec-profile p60",
-        "needs_inferred": True,
+        "name": "1_sp_new",
+        "trials": 11,
+        "client_tunnel_args": "--packet-scheduler singlepath",
+        "server_tunnel_args": "",
+        "needs_inferred": False,
     },
     {
-        "name": "arrivaltime_cloud",
-        "trials": 10,
-        "client_tunnel_args": f"--packet-scheduler arrivaltime --path-model sidecar --prediction-mode static {SIDECAR_PROVIDERS_ARGS} --fec --fec-profile cloud-gaming",
-        "server_tunnel_args": "--fec --fec-profile cloud-gaming",
-        "needs_inferred": True,
+        "name": "2_sp_fec_new",
+        "trials": 11,
+        "client_tunnel_args": "--packet-scheduler singlepath --fec --fec-profile p30",
+        "server_tunnel_args": "--fec --fec-profile p30",
+        "needs_inferred": False,
     },
     {
-        "name": "minrtt_p30",
-        "trials": 10,
+        "name": "5_minrtt_new",
+        "trials": 11,
+        "client_tunnel_args": "--packet-scheduler minrtt",
+        "server_tunnel_args": "",
+        "needs_inferred": False,
+    },
+    {
+        "name": "6_minrtt_fec_new",
+        "trials": 11,
         "client_tunnel_args": "--packet-scheduler minrtt --fec --fec-profile p30",
         "server_tunnel_args": "--fec --fec-profile p30",
         "needs_inferred": False,
     },
     {
-        "name": "minrtt_p60",
-        "trials": 10,
-        "client_tunnel_args": "--packet-scheduler minrtt --fec --fec-profile p60",
-        "server_tunnel_args": "--fec --fec-profile p60",
+        "name": "9_predictiveminrtt_new",
+        "trials": 11,
+        "client_tunnel_args": f"--packet-scheduler predictiveminrtt --path-model sidecar --prediction-mode static {SIDECAR_PROVIDERS_ARGS}",
+        "server_tunnel_args": "",
+        "needs_inferred": True,
+    },
+    {
+        "name": "10_predictiveminrtt_fec_new",
+        "trials": 11,
+        "client_tunnel_args": f"--packet-scheduler predictiveminrtt --path-model sidecar --prediction-mode static {SIDECAR_PROVIDERS_ARGS} --fec --fec-profile p30",
+        "server_tunnel_args": "--fec --fec-profile p30",
+        "needs_inferred": True,
+    },
+    {
+        "name": "7_modelminrtt_new",
+        "trials": 11,
+        "client_tunnel_args": f"--packet-scheduler modelminrtt --path-model sidecar --prediction-mode static {SIDECAR_PROVIDERS_ARGS}",
+        "server_tunnel_args": "",
+        "needs_inferred": True,
+    },
+    {
+        "name": "8_modelminrtt_fec_new",
+        "trials": 11,
+        "client_tunnel_args": f"--packet-scheduler modelminrtt --path-model sidecar --prediction-mode static {SIDECAR_PROVIDERS_ARGS} --fec --fec-profile p30",
+        "server_tunnel_args": "--fec --fec-profile p30",
+        "needs_inferred": True,
+    },
+    {
+        "name": "3_roundrobin_new",
+        "trials": 11,
+        "client_tunnel_args": "--packet-scheduler roundrobin",
+        "server_tunnel_args": "",
         "needs_inferred": False,
     },
     {
-        "name": "minrtt_cloud",
-        "trials": 10,
-        "client_tunnel_args": "--packet-scheduler minrtt --fec --fec-profile cloud-gaming",
-        "server_tunnel_args": "--fec --fec-profile cloud-gaming",
+        "name": "4_roundrobin_fec_new",
+        "trials": 11,
+        "client_tunnel_args": "--packet-scheduler roundrobin --fec --fec-profile p30",
+        "server_tunnel_args": "--fec --fec-profile p30",
         "needs_inferred": False,
     },
-    {
-        "name": "arrivaltime_kalman_model",
-        "trials": 10,
-        "client_tunnel_args": "--packet-scheduler arrivaltime --path-model kalman --prediction-mode model",
-        "server_tunnel_args": "",
-        "needs_inferred": False,  # see note above -- kalman doesn't use the sidecar
-    },
-    {
-        "name": "arrivaltime_sidecar_model",
-        "trials": 10,
-        "client_tunnel_args": f"--packet-scheduler arrivaltime --path-model sidecar --prediction-mode model {SIDECAR_PROVIDERS_ARGS}",
-        "server_tunnel_args": "",
-        "needs_inferred": True,
-    },
-    {
-        "name": "predictiveminrtt_kalman_model",
-        "trials": 10,
-        "client_tunnel_args": "--packet-scheduler predictiveminrtt --path-model kalman --prediction-mode model",
-        "server_tunnel_args": "",
-        "needs_inferred": False,  # see note above
-    },
-    {
-        "name": "predictiveminrtt_sidecar_model",
-        "trials": 10,
-        "client_tunnel_args": f"--packet-scheduler predictiveminrtt --path-model sidecar --prediction-mode model {SIDECAR_PROVIDERS_ARGS}",
-        "server_tunnel_args": "",
-        "needs_inferred": True,
-    },
-    {
-        "name": "modelminrtt_kalman_model",
-        "trials": 10,
-        "client_tunnel_args": "--packet-scheduler modelminrtt --path-model kalman --prediction-mode model",
-        "server_tunnel_args": "",
-        "needs_inferred": False,  # see note above
-    },
-    {
-        "name": "modelminrtt_sidecar_model",
-        "trials": 10,
-        "client_tunnel_args": f"--packet-scheduler modelminrtt --path-model sidecar --prediction-mode model {SIDECAR_PROVIDERS_ARGS}",
-        "server_tunnel_args": "",
-        "needs_inferred": True,
-    },
-]
 
-#EXPERIMENTS = [
-#    {
-#        "name": "predictive_model_p30",
-#        "trials": 3,
-#        "client_tunnel_args": (
-#            "--packet-scheduler predictiveminrtt "
-#            "--path-model sidecar "
-#            "--prediction-mode model "
-#            "--sidecar-sock /tmp/fec_model.sock "
-#            "--sidecar-provider quectel=10.189.55.160 "
-#            "--sidecar-provider starlink=192.168.1.241 "
-#            "--fec --fec-profile p30"
-#        ),
-#        "server_tunnel_args": "--fec --fec-profile p30",
-#        "needs_inferred": True,
-#    },
-#    {
-#        "name": "predictive_static_p30",
-#        "trials": 3,
-#        "client_tunnel_args": (
-#            "--packet-scheduler predictiveminrtt "
-#            "--path-model sidecar "
-#            "--prediction-mode static "
-#            "--sidecar-sock /tmp/fec_model.sock "
-#            "--sidecar-provider quectel=10.189.55.160 "
-#            "--sidecar-provider starlink=192.168.1.241 "
-#            "--fec --fec-profile p30"
-#        ),
-#        "server_tunnel_args": "--fec --fec-profile p30",
-#        "needs_inferred": True,
-#    },
-#    {
-#        "name": "minrtt_p30",
-#        "trials": 3,
-#        "client_tunnel_args": "--packet-scheduler minrtt --fec --fec-profile p30",
-#        "server_tunnel_args": "--fec --fec-profile p30",
-#        "needs_inferred": False,
-#    },
-#]
+]
